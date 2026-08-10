@@ -912,6 +912,7 @@ static int BrokerWsNetDisconnect(void* context);
 
 /* Forward declarations for client management used by lws callback */
 static void BrokerSubs_RemoveClient(MqttBroker* broker, BrokerClient* bc);
+static void BrokerSubs_OrphanClient(MqttBroker* broker, BrokerClient* bc);
 static void BrokerClient_Remove(MqttBroker* broker, BrokerClient* bc);
 #ifdef WOLFMQTT_BROKER_WILL
 static void BrokerClient_PublishWill(MqttBroker* broker, BrokerClient* bc);
@@ -1161,9 +1162,14 @@ static int callback_broker_mqtt(struct lws *wsi,
             }
         }
 
-        /* Peer-initiated close: publish will and remove client. */
+        /* Peer-initiated close: publish will and preserve persistent state. */
         BrokerClient_PublishWill(broker, bc);
-        BrokerSubs_RemoveClient(broker, bc);
+        if (bc->clean_session) {
+            BrokerSubs_RemoveClient(broker, bc);
+        }
+        else {
+            BrokerSubs_OrphanClient(broker, bc);
+        }
         *bc_ptr = NULL;
         if (ws != NULL && ws->processing) {
             /* bc is on the call stack inside BrokerClient_Process (a packet
