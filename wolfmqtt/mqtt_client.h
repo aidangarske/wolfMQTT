@@ -284,6 +284,11 @@ typedef struct _MqttClient {
      * flag per the wolfSSL struct guidance for booleans. */
     unsigned int keep_alive_from_server : 1;
 #endif
+#ifdef WOLFMQTT_V5
+    /* Keep new state at the end of the public object so existing field
+     * offsets remain stable for applications rebuilt with this header. */
+    MqttAuth auth;        /* Automatic enhanced-authentication exchange */
+#endif
 } MqttClient;
 
 #ifdef WOLFMQTT_SN
@@ -356,6 +361,10 @@ WOLFMQTT_API int MqttClient_SetPropertyCallback(
  *  \param      client      Pointer to MqttClient structure
  *  \param      connect     Pointer to MqttConnect structure initialized
                             with connect parameters
+ *  \note For a nonblocking or multithreaded MQTT v5 enhanced-authentication
+        exchange, keep connect->props and the authentication-method string it
+        references valid until MqttClient_Connect returns a terminal result or
+        MqttClient_NetDisconnect is called.
  *  \return     MQTT_CODE_SUCCESS if the broker accepted the connection,
                 MQTT_CODE_ERROR_CONNECT_REFUSED if the broker returned a
                 non-zero CONNACK return_code (check

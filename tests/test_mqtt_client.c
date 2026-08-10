@@ -318,10 +318,19 @@ static int g_last_ack_written;
  * the 4..7 range that g_last_ack_written tracks. */
 static int g_frames_written;
 
+/* Counts AUTH packets emitted by the automatic v5 enhanced-authentication
+ * exchange. */
+static int g_auth_frames_written;
+
 /* Packet id carried by the most recent PUBLISH-response frame written to the
  * wire. For a v3.1.1 ack the two-byte id sits right after the fixed header, so a
  * test can confirm the client echoed the id of the PUBLISH it is acknowledging. */
 static int g_last_ack_id;
+
+#if defined(WOLFMQTT_V5) && defined(WOLFMQTT_NONBLOCK)
+static int mock_net_read_empty(void *context, byte* buf, int buf_len,
+    int timeout_ms);
+#endif
 
 static int mock_net_write_accept(void *context, const byte* buf, int buf_len,
     int timeout_ms)
@@ -338,6 +347,10 @@ static int mock_net_write_accept(void *context, const byte* buf, int buf_len,
 
         /* Count the frame regardless of type. */
         g_frames_written++;
+
+        if (ack_type == MQTT_PACKET_TYPE_AUTH) {
+            g_auth_frames_written++;
+        }
 
         if (ack_type == MQTT_PACKET_TYPE_PUBLISH_REL) {
             g_pubrel_written = 1;
@@ -734,7 +747,119 @@ TEST(connect_accepted_connack_clamps_illegal_max_qos)
     ASSERT_EQ((WOLFMQTT_MAX_QOS < MQTT_QOS_1) ? (byte)WOLFMQTT_MAX_QOS :
               MQTT_QOS_1, test_client.max_qos);
 }
+
+#ifdef WOLFMQTT_NONBLOCK
+/* The automatic AUTH exchange must keep its packet state across a retry.
+ * The mock read returns no data, so each call remains in the AUTH wait state.
+ * A second AUTH write proves that the state was recreated instead of resumed. */
+TEST(connect_v5_eauth_nonblock_preserves_auth_state)
+{
+    int rc;
+    MqttConnect connect;
+    MqttProp* prop;
+    MqttProp* auth_prop;
+    int auth_props;
+    int first_auth_writes;
+    char auth_method[] = "TEST-AUTH";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.enable_eauth = 1;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_empty;
+    g_auth_frames_written = 0;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.client_id = "test_client";
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    prop = MqttProps_Add(&connect.props);
+    ASSERT_NOT_NULL(prop);
+    prop->type = MQTT_PROP_AUTH_METHOD;
+    prop->data_str.str = auth_method;
+    prop->data_str.len = 9;
+
+    rc = MqttClient_Connect(&test_client, &connect);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    first_auth_writes = g_auth_frames_written;
+    ASSERT_EQ(1, first_auth_writes);
+    auth_props = 0;
+    for (auth_prop = test_client.auth.props; auth_prop != NULL;
+            auth_prop = auth_prop->next) {
+        if (auth_prop->type == MQTT_PROP_AUTH_METHOD) {
+            auth_props++;
+        }
+    }
+    ASSERT_EQ(1, auth_props);
+
+    rc = MqttClient_Connect(&test_client, &connect);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_EQ(first_auth_writes, g_auth_frames_written);
+    auth_props = 0;
+    for (auth_prop = test_client.auth.props; auth_prop != NULL;
+            auth_prop = auth_prop->next) {
+        if (auth_prop->type == MQTT_PROP_AUTH_METHOD) {
+            auth_props++;
+        }
+    }
+    ASSERT_EQ(1, auth_props);
+
+    MqttProps_Free(connect.props);
+    connect.props = NULL;
+    MqttClient_DeInit(&test_client);
+    test_client_inited = 0;
+}
+
+/* A pending automatic AUTH exchange owns a property until it reaches a
+ * terminal result. Network teardown must release that state before the
+ * caller reuses or deinitializes the client. */
+TEST(connect_v5_eauth_netdisconnect_resets_auth_state)
+{
+    int rc;
+    MqttConnect connect;
+    MqttProp* prop;
+    char auth_method[] = "TEST-AUTH";
+
+    rc = test_init_client();
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    test_client.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    test_client.enable_eauth = 1;
+    test_net.write = mock_net_write_accept;
+    test_net.read = mock_net_read_empty;
+
+    XMEMSET(&connect, 0, sizeof(connect));
+    connect.client_id = "test_client";
+    connect.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    prop = MqttProps_Add(&connect.props);
+    ASSERT_NOT_NULL(prop);
+    prop->type = MQTT_PROP_AUTH_METHOD;
+    prop->data_str.str = auth_method;
+    prop->data_str.len = 9;
+
+    rc = MqttClient_Connect(&test_client, &connect);
+    ASSERT_EQ(MQTT_CODE_CONTINUE, rc);
+    ASSERT_NOT_NULL(test_client.auth.props);
+
+    rc = MqttClient_NetDisconnect(&test_client);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_NULL(test_client.auth.props);
+    ASSERT_EQ(MQTT_MSG_BEGIN, test_client.auth.stat.write);
+    ASSERT_EQ(MQTT_MSG_BEGIN, test_client.auth.stat.read);
+
+    MqttProps_Free(connect.props);
+    connect.props = NULL;
+}
+#endif
 #endif /* WOLFMQTT_V5 */
+
+#if defined(WOLFMQTT_V5) && defined(WOLFMQTT_NONBLOCK)
+static int mock_net_read_empty(void *context, byte* buf, int buf_len,
+    int timeout_ms)
+{
+    (void)context; (void)buf; (void)buf_len; (void)timeout_ms;
+    return 0;
+}
+#endif
 
 /* A broker that rejects a subscription returns a SUBACK whose
  * per-topic return code has the high bit set (0x80 in v3.1.1, any reason
@@ -2659,6 +2784,10 @@ void run_mqtt_client_tests(void)
     RUN_TEST(connect_v5_scrubs_connack_auth_data_from_rx_buf);
     RUN_TEST(connect_refused_connack_preserves_v5_defaults);
     RUN_TEST(connect_accepted_connack_clamps_illegal_max_qos);
+#ifdef WOLFMQTT_NONBLOCK
+    RUN_TEST(connect_v5_eauth_nonblock_preserves_auth_state);
+    RUN_TEST(connect_v5_eauth_netdisconnect_resets_auth_state);
+#endif
 #endif
 
     /* MqttClient_Disconnect tests */
