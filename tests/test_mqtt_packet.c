@@ -2265,11 +2265,61 @@ TEST(encode_connect_password_without_username)
 
     XMEMSET(&conn, 0, sizeof(conn));
     conn.client_id = "test_client";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_4;
     conn.username = NULL;
     conn.password = "secret";
     rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
     ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
 }
+
+TEST(encode_connect_v31_password_without_username)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.protocol_level = 3; /* MQTT 3.1 protocol level */
+    conn.password = "secret";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+}
+
+#ifdef WOLFMQTT_V5
+/* MQTT v5 permits the Password Flag without the User Name Flag.
+ * [MQTT-3.1.2-22] is scoped to MQTT 3.1.1; v5 section 3.1.2.9
+ * explicitly removes that restriction. */
+TEST(encode_connect_v5_password_without_username)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    conn.password = "secret";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_TRUE(rc > 0);
+}
+#else
+/* A build without v5 support cannot encode the v5 CONNECT Properties
+ * Length field, so it must reject an application-selected v5 level. */
+TEST(encode_connect_v5_password_without_username)
+{
+    byte tx_buf[256];
+    MqttConnect conn;
+    int rc;
+
+    XMEMSET(&conn, 0, sizeof(conn));
+    conn.client_id = "test_client";
+    conn.protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL_5;
+    conn.password = "secret";
+    rc = MqttEncode_Connect(tx_buf, (int)sizeof(tx_buf), &conn);
+    ASSERT_EQ(MQTT_CODE_ERROR_BAD_ARG, rc);
+}
+#endif
 
 TEST(encode_connect_username_and_password)
 {
@@ -5438,6 +5488,8 @@ void run_mqtt_packet_tests(void)
 
     /* MqttEncode_Connect */
     RUN_TEST(encode_connect_password_without_username);
+    RUN_TEST(encode_connect_v31_password_without_username);
+    RUN_TEST(encode_connect_v5_password_without_username);
     RUN_TEST(encode_connect_username_and_password);
     RUN_TEST(encode_connect_binary_password_accepted);
     RUN_TEST(encode_connect_invalid_utf8_clientid_rejected);

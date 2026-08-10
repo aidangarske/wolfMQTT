@@ -1259,9 +1259,15 @@ int MqttEncode_Connect(byte *tx_buf, int tx_buf_len, MqttConnect *mc_connect)
         mc_connect->protocol_level = MQTT_CONNECT_PROTOCOL_LEVEL;
     }
 
-    /* [MQTT-3.1.2-22]: If the User Name Flag is set to 0, the Password Flag
-     * MUST be set to 0 */
+    /* [MQTT-3.1.2-22]: MQTT 3.1 and 3.1.1 require User Name when Password
+     * is set. MQTT v5 section 3.1.2.9 permits Password without User Name,
+     * but only when this build can encode the v5 property-length field. */
+#ifdef WOLFMQTT_V5
+    if (mc_connect->protocol_level != MQTT_CONNECT_PROTOCOL_LEVEL_5 &&
+            mc_connect->password != NULL && mc_connect->username == NULL) {
+#else
     if (mc_connect->password != NULL && mc_connect->username == NULL) {
+#endif
         return MQTT_TRACE_ERROR(MQTT_CODE_ERROR_BAD_ARG);
     }
 
