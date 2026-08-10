@@ -214,6 +214,137 @@ static void install_mock_net(MqttBrokerNet* net)
     net->close  = mock_close;
 }
 
+#ifdef WOLFMQTT_BROKER_PERSIST
+static int persist_restore_test_get(void* ctx, byte ns, const byte* key,
+    word16 key_len, byte* out, word32* inout_len)
+{
+    static const byte meta[] = {
+        'W', 'M', 'Q', 'B', 0x00, 0x03, BROKER_PERSIST_NS_META, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03
+    };
+
+    (void)ctx; (void)key; (void)key_len;
+    if (ns != BROKER_PERSIST_NS_META || out == NULL || inout_len == NULL ||
+            *inout_len < (word32)sizeof(meta)) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+    XMEMCPY(out, meta, sizeof(meta));
+    *inout_len = sizeof(meta);
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_restore_test_iter(void* ctx, byte ns,
+    MqttBrokerPersist_IterCb cb, void* cb_ctx)
+{
+    (void)ctx; (void)ns; (void)cb; (void)cb_ctx;
+    return MQTT_CODE_ERROR_NETWORK;
+}
+
+typedef struct PersistRestoreDeleteTest {
+    int iterating;
+    int session_callback_count;
+    int session_callback_rc;
+    int deletes;
+    int deletes_during_iter;
+    byte session[64];
+    word32 session_len;
+} PersistRestoreDeleteTest;
+
+static int persist_restore_delete_test_iter(void* ctx, byte ns,
+    MqttBrokerPersist_IterCb cb, void* cb_ctx)
+{
+    PersistRestoreDeleteTest* state = (PersistRestoreDeleteTest*)ctx;
+    int rc = MQTT_CODE_SUCCESS;
+
+    if (ns == BROKER_PERSIST_NS_SESSION) {
+        state->iterating = 1;
+        rc = cb((const byte*)"x", 1, state->session, state->session_len,
+            cb_ctx);
+        state->iterating = 0;
+        state->session_callback_count++;
+        state->session_callback_rc = rc;
+    }
+    return rc;
+}
+
+static int persist_restore_delete_test_put(void* ctx, byte ns,
+    const byte* key, word16 key_len, const byte* blob, word32 blob_len)
+{
+    PersistRestoreDeleteTest* state = (PersistRestoreDeleteTest*)ctx;
+
+    (void)key;
+    (void)key_len;
+    if (ns != BROKER_PERSIST_NS_SESSION || blob_len > sizeof(state->session)) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+    XMEMCPY(state->session, blob, blob_len);
+    state->session_len = blob_len;
+    return MQTT_CODE_SUCCESS;
+}
+
+static int persist_restore_delete_test_del(void* ctx, byte ns,
+    const byte* key, word16 key_len)
+{
+    PersistRestoreDeleteTest* state = (PersistRestoreDeleteTest*)ctx;
+
+    (void)ns;
+    (void)key;
+    (void)key_len;
+    state->deletes++;
+    if (state->iterating) {
+        state->deletes_during_iter++;
+    }
+    return MQTT_CODE_SUCCESS;
+}
+
+TEST(broker_persist_restore_propagates_iterator_error)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks hooks;
+    int rc;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    hooks.kv_get = persist_restore_test_get;
+    hooks.kv_iter = persist_restore_test_iter;
+    broker.persist = &hooks;
+
+    rc = BrokerPersist_Restore(&broker);
+    ASSERT_EQ(MQTT_CODE_ERROR_NETWORK, rc);
+}
+
+TEST(broker_persist_restore_defers_legacy_session_delete)
+{
+    MqttBroker broker;
+    MqttBrokerPersistHooks hooks;
+    PersistRestoreDeleteTest state;
+    int rc;
+
+    XMEMSET(&broker, 0, sizeof(broker));
+    XMEMSET(&hooks, 0, sizeof(hooks));
+    XMEMSET(&state, 0, sizeof(state));
+    hooks.ctx = &state;
+    hooks.kv_put = persist_restore_delete_test_put;
+    hooks.kv_get = persist_restore_test_get;
+    hooks.kv_iter = persist_restore_delete_test_iter;
+    hooks.kv_del = persist_restore_delete_test_del;
+    broker.persist = &hooks;
+
+    rc = BrokerPersist_PutOrphanSession(&broker, "x",
+        MQTT_CONNECT_PROTOCOL_LEVEL_4, 1, 0);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_TRUE(state.session_len > 17);
+    XMEMSET(&state.session[14], 0, 4);
+
+    rc = BrokerPersist_Restore(&broker);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, rc);
+    ASSERT_EQ(1, state.session_callback_count);
+    ASSERT_EQ(MQTT_CODE_SUCCESS, state.session_callback_rc);
+    ASSERT_EQ(2, state.deletes);
+    ASSERT_EQ(0, state.deletes_during_iter);
+}
+#endif
+
 /* Drive the broker through enough Step() calls to consume the CONNECT and
  * emit the CONNACK. The first Step() accepts the client; the second reads
  * and dispatches the CONNECT, which writes the CONNACK and may close. */
@@ -3625,6 +3756,10 @@ int main(int argc, char** argv)
 #ifdef WOLFMQTT_V5
     RUN_TEST(connect_v5_emptyid_assigned_id_emitted);
     RUN_TEST(connect_v5_emptyid_clean0_accepted);
+#endif
+#ifdef WOLFMQTT_BROKER_PERSIST
+    RUN_TEST(broker_persist_restore_propagates_iterator_error);
+    RUN_TEST(broker_persist_restore_defers_legacy_session_delete);
 #endif
     RUN_TEST(qos2_duplicate_publish_dedup);
     RUN_TEST(qos2_phantom_dup_publish_is_fresh);

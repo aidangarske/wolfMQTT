@@ -50,6 +50,47 @@
 
 #ifdef WOLFMQTT_BROKER_PERSIST
 
+static int wmqb_valid_client_id(const byte* client_id, word16 len)
+{
+    return client_id != NULL && len > 0 &&
+        XMEMCHR(client_id, 0, len) == NULL;
+}
+
+static void wmqb_log_client_id(char* buf, size_t buf_len,
+    const char* client_id)
+{
+    size_t i;
+
+    if (buf == NULL || buf_len == 0) {
+        return;
+    }
+    if (client_id == NULL) {
+        XSTRNCPY(buf, "(null)", buf_len - 1);
+        buf[buf_len - 1] = '\0';
+        return;
+    }
+    for (i = 0; i + 1 < buf_len && client_id[i] != '\0'; i++) {
+        buf[i] = ((byte)client_id[i] < 0x20 ||
+            (byte)client_id[i] == 0x7f) ? '?' : client_id[i];
+    }
+    buf[i] = '\0';
+}
+
+static void wmqb_del_session_and_subs(MqttBroker* broker,
+    const byte* client_id, word16 client_id_len)
+{
+    char client_id_buf[BROKER_MAX_CLIENT_ID_LEN];
+
+    if (!wmqb_valid_client_id(client_id, client_id_len) ||
+            client_id_len >= sizeof(client_id_buf)) {
+        return;
+    }
+    XMEMCPY(client_id_buf, client_id, client_id_len);
+    client_id_buf[client_id_len] = '\0';
+    (void)BrokerPersist_DelSubs(broker, client_id_buf);
+    (void)BrokerPersist_DelSession(broker, client_id_buf);
+}
+
 /* The broker has private static structs we need to inspect (BrokerSub,
  * BrokerRetainedMsg, BrokerOutPub). Pull them in by including the public
  * header which exposes the typedefs. mqtt_broker.c defines static
@@ -648,6 +689,10 @@ int BrokerPersist_PutSession(MqttBroker* broker,
      * 0xFFFFFFFF (never expire) for clean_session=0 v3.1.1 sessions. */
 #ifndef WOLFMQTT_STATIC_MEMORY
     expiry = c->session_expiry_sec;
+    if (expiry == 0) {
+        (void)BrokerPersist_DelSubs(broker, cid);
+        return BrokerPersist_DelSession(broker, cid);
+    }
 #else
     expiry = 0xFFFFFFFFu;
 #endif
@@ -665,6 +710,10 @@ int BrokerPersist_PutOrphanSession(MqttBroker* broker, const char* client_id,
     if (broker == NULL || broker->persist == NULL || client_id == NULL ||
             *client_id == '\0') {
         return 0;
+    }
+    if (session_expiry_sec == 0) {
+        (void)BrokerPersist_DelSubs(broker, client_id);
+        return BrokerPersist_DelSession(broker, client_id);
     }
     return wmqb_put_session_record(broker, client_id,
         (word16)XSTRLEN(client_id), protocol_level, session_expiry_sec,
@@ -1194,7 +1243,50 @@ struct wmqb_restore_ctx {
     MqttBroker* broker;
     int         loaded;
     int         skipped;
+    int         delete_count;
+    int         delete_rc;
+    char        delete_client_id[BROKER_MAX_PERSIST_SESSIONS]
+                                [BROKER_MAX_CLIENT_ID_LEN];
 };
+
+static int wmqb_restore_defer_session_delete(struct wmqb_restore_ctx* ctx,
+    const byte* client_id, word16 client_id_len)
+{
+    int i;
+
+    if (ctx == NULL || !wmqb_valid_client_id(client_id, client_id_len) ||
+            client_id_len >= BROKER_MAX_CLIENT_ID_LEN) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+    for (i = 0; i < ctx->delete_count; i++) {
+        if (XSTRLEN(ctx->delete_client_id[i]) == client_id_len &&
+                XMEMCMP(ctx->delete_client_id[i], client_id,
+                    client_id_len) == 0) {
+            return 0;
+        }
+    }
+    if (ctx->delete_count >= BROKER_MAX_PERSIST_SESSIONS) {
+        ctx->delete_rc = MQTT_CODE_ERROR_OUT_OF_BUFFER;
+        return MQTT_CODE_ERROR_OUT_OF_BUFFER;
+    }
+    XMEMCPY(ctx->delete_client_id[ctx->delete_count], client_id,
+        client_id_len);
+    ctx->delete_client_id[ctx->delete_count][client_id_len] = '\0';
+    ctx->delete_count++;
+    return 0;
+}
+
+static void wmqb_restore_delete_deferred(struct wmqb_restore_ctx* ctx)
+{
+    int i;
+
+    for (i = 0; i < ctx->delete_count; i++) {
+        wmqb_del_session_and_subs(ctx->broker,
+            (const byte*)ctx->delete_client_id[i],
+            (word16)XSTRLEN(ctx->delete_client_id[i]));
+    }
+    ctx->delete_count = 0;
+}
 
 #ifndef WOLFMQTT_STATIC_MEMORY
 /* Create an orphan slot from a NS_SESSION record. Does NOT call the
@@ -1205,7 +1297,8 @@ static BrokerOrphanSession* wmqb_restore_create_orphan(MqttBroker* broker,
     word32 session_expiry_sec, word64 orphan_since)
 {
     BrokerOrphanSession* o;
-    if (broker == NULL || client_id == NULL || cid_len == 0) {
+    if (broker == NULL || !wmqb_valid_client_id(client_id, cid_len) ||
+            session_expiry_sec == 0) {
         return NULL;
     }
     if (broker->orphan_session_count >= BROKER_MAX_PERSIST_SESSIONS) {
@@ -1455,6 +1548,12 @@ static int wmqb_decode_and_insert_subs(MqttBroker* broker,
     if (key == NULL || key_len == 0) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
+#ifndef WOLFMQTT_STATIC_MEMORY
+    if (!wmqb_valid_client_id(key, key_len) ||
+            wmqb_restore_find_orphan(broker, key, key_len) == NULL) {
+        return MQTT_CODE_ERROR_NOT_FOUND;
+    }
+#endif
     p = &blob[WMQB_HDR_LEN];
     end = p + body_len;
     if ((word32)(end - p) < 2) {
@@ -1610,7 +1709,7 @@ static int wmqb_iter_subs_cb(const byte* key, word16 key_len,
 
 #ifndef WOLFMQTT_STATIC_MEMORY
 /* Decode NS_SESSION record and create a matching orphan slot. */
-static int wmqb_decode_and_insert_session(MqttBroker* broker,
+static int wmqb_decode_and_insert_session(struct wmqb_restore_ctx* ctx,
     const byte* blob, word32 blob_len)
 {
     word32 body_len = 0;
@@ -1637,7 +1736,13 @@ static int wmqb_decode_and_insert_session(MqttBroker* broker,
     if (body_len < (word32)(16 + cid_len)) {
         return MQTT_CODE_ERROR_MALFORMED_DATA;
     }
-    if (wmqb_restore_create_orphan(broker, &p[16], cid_len, proto_level,
+    if (!wmqb_valid_client_id(&p[16], cid_len)) {
+        return MQTT_CODE_ERROR_MALFORMED_DATA;
+    }
+    if (session_expiry == 0) {
+        return wmqb_restore_defer_session_delete(ctx, &p[16], cid_len);
+    }
+    if (wmqb_restore_create_orphan(ctx->broker, &p[16], cid_len, proto_level,
             session_expiry, orphan_since) == NULL) {
         return MQTT_CODE_ERROR_MEMORY;
     }
@@ -1650,7 +1755,7 @@ static int wmqb_iter_session_cb(const byte* key, word16 key_len,
     struct wmqb_restore_ctx* c = (struct wmqb_restore_ctx*)cb_ctx;
     int rc;
     (void)key; (void)key_len;
-    rc = wmqb_decode_and_insert_session(c->broker, blob, blob_len);
+    rc = wmqb_decode_and_insert_session(c, blob, blob_len);
     if (rc == 0) {
         c->loaded++;
     }
@@ -1829,6 +1934,7 @@ static void wmqb_restore_expiry_sweep(MqttBroker* broker)
 {
     BrokerOrphanSession* cur = broker->orphan_sessions;
     WOLFMQTT_BROKER_TIME_T now = WOLFMQTT_BROKER_GET_TIME_S();
+    char client_id_log[128];
     while (cur != NULL) {
         BrokerOrphanSession* next = cur->next;
         /* Sign-safe elapsed-time check. The unsigned subtraction would
@@ -1841,10 +1947,12 @@ static void wmqb_restore_expiry_sweep(MqttBroker* broker)
                 now >= cur->orphan_since &&
                 (word64)(now - cur->orphan_since) >=
                     (word64)cur->session_expiry_sec) {
+            wmqb_log_client_id(client_id_log, sizeof(client_id_log),
+                cur->client_id);
             WMQB_LOG_INFO(broker,
                 "broker: persist expired session client_id=%s "
                 "(expiry=%us)",
-                cur->client_id == NULL ? "(null)" : cur->client_id,
+                client_id_log,
                 (unsigned)cur->session_expiry_sec);
             /* Shared teardown lives in mqtt_broker.c so the eviction
              * path and this expiry-sweep path can't drift. Drops
@@ -2004,42 +2112,71 @@ int BrokerPersist_Restore(MqttBroker* broker)
 #ifndef WOLFMQTT_STATIC_MEMORY
     /* Sessions first so subs and OUTQ entries can find their owner. */
     if (h->kv_iter != NULL) {
-        (void)wmqb_kv_iter(broker, BROKER_PERSIST_NS_SESSION,
+        rc = wmqb_kv_iter(broker, BROKER_PERSIST_NS_SESSION,
             wmqb_iter_session_cb, &ctx);
         WMQB_LOG_INFO(broker,
             "broker: persist restore sessions loaded=%d skipped=%d",
             ctx.loaded, ctx.skipped);
+        if (rc != 0) {
+            WMQB_LOG_ERR(broker,
+                "broker: persist restore sessions failed rc=%d", rc);
+            BrokerPersist_RestoreRollback(broker);
+            return rc;
+        }
+        wmqb_restore_delete_deferred(&ctx);
+        if (ctx.delete_rc != 0) {
+            BrokerPersist_RestoreRollback(broker);
+            return ctx.delete_rc;
+        }
         ctx.loaded = 0;
         ctx.skipped = 0;
     }
 #endif
 #ifdef WOLFMQTT_BROKER_RETAINED
     if (h->kv_iter != NULL) {
-        (void)wmqb_kv_iter(broker, BROKER_PERSIST_NS_RETAINED,
+        rc = wmqb_kv_iter(broker, BROKER_PERSIST_NS_RETAINED,
             wmqb_iter_retained_cb, &ctx);
         WMQB_LOG_INFO(broker,
             "broker: persist restore retained loaded=%d skipped=%d",
             ctx.loaded, ctx.skipped);
+        if (rc != 0) {
+            WMQB_LOG_ERR(broker,
+                "broker: persist restore retained failed rc=%d", rc);
+            BrokerPersist_RestoreRollback(broker);
+            return rc;
+        }
         ctx.loaded = 0;
         ctx.skipped = 0;
     }
 #endif
     if (h->kv_iter != NULL) {
-        (void)wmqb_kv_iter(broker, BROKER_PERSIST_NS_SUBS,
+        rc = wmqb_kv_iter(broker, BROKER_PERSIST_NS_SUBS,
             wmqb_iter_subs_cb, &ctx);
         WMQB_LOG_INFO(broker,
             "broker: persist restore subs loaded=%d skipped=%d",
             ctx.loaded, ctx.skipped);
+        if (rc != 0) {
+            WMQB_LOG_ERR(broker,
+                "broker: persist restore subs failed rc=%d", rc);
+            BrokerPersist_RestoreRollback(broker);
+            return rc;
+        }
         ctx.loaded = 0;
         ctx.skipped = 0;
     }
 #ifndef WOLFMQTT_STATIC_MEMORY
     if (h->kv_iter != NULL) {
-        (void)wmqb_kv_iter(broker, BROKER_PERSIST_NS_OUTQ,
+        rc = wmqb_kv_iter(broker, BROKER_PERSIST_NS_OUTQ,
             wmqb_iter_outq_cb, &ctx);
         WMQB_LOG_INFO(broker,
             "broker: persist restore outq loaded=%d skipped=%d",
             ctx.loaded, ctx.skipped);
+        if (rc != 0) {
+            WMQB_LOG_ERR(broker,
+                "broker: persist restore outq failed rc=%d", rc);
+            BrokerPersist_RestoreRollback(broker);
+            return rc;
+        }
     }
     /* v5 Session Expiry sweep: drop any orphan whose session_expiry has
      * elapsed since orphan_since was stamped. Cascades to its subs and

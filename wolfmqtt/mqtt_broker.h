@@ -846,6 +846,7 @@ WOLFMQTT_LOCAL int BrokerPersist_DelOutQueue(MqttBroker* broker,
  * installed. Wipes everything and re-stamps the META namespace if
  * the persisted schema version doesn't match. */
 WOLFMQTT_LOCAL int BrokerPersist_Restore(MqttBroker* broker);
+WOLFMQTT_LOCAL void BrokerPersist_RestoreRollback(MqttBroker* broker);
 #endif /* WOLFMQTT_BROKER_PERSIST */
 
 #ifndef WOLFMQTT_STATIC_MEMORY

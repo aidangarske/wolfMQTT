@@ -6632,6 +6632,39 @@ int MqttBroker_Stop(MqttBroker* broker)
     return MQTT_CODE_SUCCESS;
 }
 
+#ifdef WOLFMQTT_BROKER_PERSIST
+/* Restore runs before the broker accepts clients. If a backend iterator fails
+ * after loading some records, discard the in-memory prefix so a caller can
+ * safely retry or free the broker without retaining a partial session. */
+WOLFMQTT_LOCAL void BrokerPersist_RestoreRollback(MqttBroker* broker)
+{
+    if (broker == NULL) {
+        return;
+    }
+#ifdef WOLFMQTT_STATIC_MEMORY
+    XMEMSET(broker->subs, 0, sizeof(broker->subs));
+#else
+    while (broker->subs != NULL) {
+        BrokerSub* next = broker->subs->next;
+        if (broker->subs->filter != NULL) {
+            BROKER_FORCE_ZERO(broker->subs->filter,
+                XSTRLEN(broker->subs->filter) + 1);
+            WOLFMQTT_FREE(broker->subs->filter);
+        }
+        if (broker->subs->client_id != NULL) {
+            WOLFMQTT_FREE(broker->subs->client_id);
+        }
+        WOLFMQTT_FREE(broker->subs);
+        broker->subs = next;
+    }
+    BrokerOrphan_FreeAll(broker);
+#endif
+#ifdef WOLFMQTT_BROKER_RETAINED
+    BrokerRetained_FreeAll(broker);
+#endif
+}
+#endif
+
 int MqttBroker_Free(MqttBroker* broker)
 {
     if (broker == NULL) {
