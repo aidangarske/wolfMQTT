@@ -234,6 +234,16 @@ typedef struct _MqttSk {
     #endif
 #endif
 
+#ifdef WOLFMQTT_V5
+    /* Bytes of the CONNECT Authentication Method retained to enforce that a
+     * later client-initiated AUTH reuses the same method [MQTT-4.12.0-1]. A
+     * CONNECT method longer than this cannot be verified and re-authentication
+     * is refused; override in user_settings.h if longer names are needed. */
+    #ifndef MQTT_AUTH_METHOD_MAX
+        #define MQTT_AUTH_METHOD_MAX 32
+    #endif
+#endif
+
 /* Client structure */
 typedef struct _MqttClient {
     word32       flags; /* MqttClientFlags */
@@ -334,6 +344,16 @@ typedef struct _MqttClient {
      * with PUBREC but not delivered a second time [MQTT-4.3.3-10]. Slot value 0
      * is empty; a QoS 2 packet id is never 0. */
     word16 recv_qos2_pending[MQTT_MAX_RECV_QOS2];
+#endif
+
+#ifdef WOLFMQTT_V5
+    /* CONNECT Authentication Method value, retained so a later client-initiated
+     * AUTH must reuse the same method [MQTT-4.12.0-1]. auth_method_len is the
+     * full value length; when it exceeds MQTT_AUTH_METHOD_MAX the value could
+     * not be stored and re-auth is refused. Placed at the end of the struct so
+     * existing member offsets are unchanged. */
+    word16 auth_method_len;
+    byte   auth_method[MQTT_AUTH_METHOD_MAX];
 #endif
 } MqttClient;
 
